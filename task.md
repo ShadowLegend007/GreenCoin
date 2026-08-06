@@ -4,73 +4,146 @@ The backend API server for the GreenCoin e-waste recycling platform. Built with 
 
 ---
 
-## What Was Built
+## GreenCoin Backend Architecture
+
+**Goal**
+Build a secure, robust, and scalable RESTful API server for the GreenCoin e-waste recycling platform. The backend handles user authentication, manages the strict lifecycle of e-waste pickups, and powers a decoupled gamification engine to drive user engagement.
+
+The architecture strictly enforces separation of concerns by isolating business logic (Services) from HTTP transport (Controllers) and validation (Zod Middlewares).
+
+### High-Level Architecture
+```text
+                     CLIENT REQUESTS
+                           │
+                           ▼
+                  Express Router (Express 5)
+                           │
+        ┌──────────────────┼────────────────────┐
+        │                  │                    │
+   Zod Validation    JWT Auth Guard       RBAC Middleware
+   (Req.body)       (Extracts user)      (Checks Roles)
+        │                  │                    │
+        └──────────────────┼────────────────────┘
+                           │
+                     Controllers
+               (Extracts params/body)
+                           │
+                           ▼
+                       Services
+               (Core Business Logic)
+                           │
+        ┌──────────────────┼────────────────────┐
+        │                  │                    │
+  State Machine       Rewards Client       Mongoose Models
+(Enforces Rules)    (External APIs)       (MongoDB Access)
+        │                  │                    │
+        └──────────────────┼────────────────────┘
+                           │
+                           ▼
+                   Event Dispatcher ───► Gamification Event Bus
+```
+
+### Scalability & Design Principles
+- **Strict Data Validation:** Zod intercepts bad payloads at the routing layer, guaranteeing the controller and service only process safe, correctly-typed data.
+- **Centralized Error Handling:** All errors bubble up to a single Express middleware that formats them consistently `{ success: false, error: "ERROR_CODE", message: "..." }`, hiding stack traces from clients.
+- **State Machine Integrity:** Hardcoding state transitions in an isolated map guarantees that no rogue API call can mutate a pickup into an illegal state.
+- **Event-Driven Decoupling:** Core operations (like picking up a laptop) have zero dependencies on engagement operations (like awarding XP). If the gamification engine crashes, core business workflows remain unaffected.
+- **Structured Logging:** A centralized logger ensures production logs are parsable (JSON/ISO timestamps) and easily suppressed during test runs to reduce noise.
+
+---
+
+## Detailed Implementation Breakdown
 
 This backend implements the **Pickup Module**, **Authentication & Users Module**, and the **Gamification Engine** — forming the core workflows of the GreenCoin ecosystem. Below is a breakdown of everything that was done.
 
-### 1. Pickup Lifecycle & State Machine
+### 1. Pickup Module Architecture
 
-A pickup request moves through a strict, forward-only state machine:
+**Goal**
+Manage the core e-waste recycling lifecycle—from request to verification—while enforcing strict role-based access controls and a forward-only state machine to prevent inconsistent states.
 
+#### High-Level Architecture
+```text
+                     USER ACTIONS (App/Web)
+                           │
+        ┌──────────────────┼────────────────────┐
+        │                  │                    │
+  Request Pickup      Accept Pickup       Verify & Complete
+  (Role: User)     (Role: Collector)      (Role: Admin)
+        │                  │                    │
+        └──────────────────┼────────────────────┘
+                           │
+                   Pickup Controller
+               (Zod Validation + Auth)
+                           │
+                           ▼
+                     Pickup Service
+              (Enforces State Machine)
+                           │
+        ┌──────────────────┼──────────────────┐
+        │                  │                  │
+        ▼                  ▼                  ▼
+ Database (Mongoose) Rewards Client  Event Dispatcher
+   (Save State)    (Trigger Rewards)  (Gamification)
 ```
+
+#### Folder Structure
+```text
+pickup/
+│
+├── pickup.routes.ts              # Route definitions & middleware chain
+├── pickup.controller.ts          # Request/Response orchestration
+├── pickup.service.ts             # Core CRUD and status logic
+├── pickup.model.ts               # Mongoose schemas for Pickups & Devices
+├── pickup.validation.ts          # Zod schemas for input validation
+├── pickup-state-machine.ts       # Forward-only transition rules
+├── rewards-client.ts             # External HTTP client for Rewards service
+│
+├── collection-center.routes.ts   # Collection center routes
+├── collection-center.controller.ts # Collection center orchestration
+├── collection-center.service.ts  # Collection center logic
+└── collection-center.validation.ts # Zod schemas for collection centers
+```
+
+#### State Machine Pipeline
+A pickup request moves through a strict, forward-only lifecycle mapped in `pickup-state-machine.ts`:
+```text
 Requested → Accepted → Picked → Delivered → Verified ─┬─→ Reward Generated
-                                                       └─→ Verification Failed
+                                                      └─→ Verification Failed
+```
+- **Only valid forward transitions are allowed.** Bypassing a step (e.g. `Requested → Delivered`) throws a `400 INVALID_TRANSITION` error.
+- **`Verification Failed`** is reached only when the Rewards service handoff fails, preventing pickups from getting stuck in limbo due to network errors.
+
+#### Business Rules Enforced
+- **Collector Assignment**: A collector must be *assigned* to a pickup before updating its status.
+- **Strict Role Isolation**: A different collector cannot update a pickup they are not assigned to (`403 FORBIDDEN_NOT_ASSIGNED_COLLECTOR`).
+- **No Double Acceptance**: A pickup that already has a collector cannot be accepted again (`403 FORBIDDEN_ALREADY_ASSIGNED`).
+- **Data Isolation**: Users can only view their own pickups. Collectors can only view pickups that are `Requested` or explicitly assigned to them.
+- **Param Validation**: Prevents 500 crashes (`CastError`) by enforcing valid MongoDB ObjectIds format on all route parameters.
+
+#### Database Collections
+- **Pickups (`pickups`)**: Tracks state, `pickupTime`, `userId`, `collectorId`, and embedded `deviceId`.
+- **Devices (`devices`)**: Stores the physical item's `category` and `weight`.
+- **Collection Centers (`collection_centers`)**: Admin-managed physical drop-off locations (`name`, `location`).
+
+#### API Layer
+```text
+# Pickups
+POST   /api/v1/pickups                 (User)
+GET    /api/v1/pickups                 (User/Collector/Admin)
+GET    /api/v1/pickups/:id             (User/Collector/Admin)
+PATCH  /api/v1/pickups/:id/accept      (Collector)
+PATCH  /api/v1/pickups/:id/status      (Collector)
+PATCH  /api/v1/pickups/:id/verify      (Admin)
+
+# Collection Centers
+GET    /api/v1/collection-centers      (Authenticated)
+POST   /api/v1/collection-centers      (Admin)
 ```
 
-- **Only valid forward transitions are allowed.** Attempting to skip a step (e.g. `Requested → Delivered`) or go backward (e.g. `Delivered → Picked`) is rejected with a `400 INVALID_TRANSITION` error.
-- The state machine is implemented in [`pickup-state-machine.ts`](src/pickup/pickup-state-machine.ts) as a standalone class with a static transition map, making it easy to test and extend.
-- **`Verification Failed`** is reached only when the Rewards service handoff fails after successful verification, which prevents pickups from getting silently stuck in case of network errors.
-
-### 2. Pickup CRUD & Status Update Endpoints
-
-Full REST API for pickup management, implemented across the following files:
-
-- **Routes** → [`pickup.routes.ts`](src/pickup/pickup.routes.ts): Maps HTTP verbs and endpoints to the respective controller actions, integrating Auth and Zod validations.
-- **Controller** → [`pickup.controller.ts`](src/pickup/pickup.controller.ts): Orchestrates logic, extracts data from requests (`req.body`, `req.params`, `req.user`), checks roles, calls the service, and sends HTTP responses.
-- **Service** → [`pickup.service.ts`](src/pickup/pickup.service.ts): Handles database interactions (Mongoose) and enforces business rules/state transitions.
-- **Model** → [`pickup.model.ts`](src/pickup/pickup.model.ts): Defines the Mongoose schemas and TypeScript interfaces for Pickup and Device entities.
-- **Rewards Client** → [`rewards-client.ts`](src/pickup/rewards-client.ts): An HTTP client wrapper around native Node `fetch` used to trigger the external Rewards Service logic.
-
-| Method | Endpoint | Role | Description |
-|--------|----------|------|-------------|
-| `POST` | `/api/v1/pickups` | User | Create a new pickup request with device info |
-| `GET` | `/api/v1/pickups` | User/Collector/Admin | List pickups (filtered by role) |
-| `GET` | `/api/v1/pickups/:id` | User/Collector/Admin | Get a specific pickup by ID |
-| `PATCH` | `/api/v1/pickups/:id/accept` | Collector | Accept a pickup (assigns collector) |
-| `PATCH` | `/api/v1/pickups/:id/status` | Collector | Update pickup status (next valid state) |
-| `PATCH` | `/api/v1/pickups/:id/verify` | Admin | Verifies a delivered pickup and triggers Rewards |
-
-**Key business rules enforced & Vulnerabilities fixed:**
-
-- A collector must be **assigned** to a pickup before updating its status.
-- A different collector **cannot** update a pickup they're not assigned to (`403 FORBIDDEN_NOT_ASSIGNED_COLLECTOR`).
-- A pickup that already has a collector **cannot** be accepted again (`403 FORBIDDEN_ALREADY_ASSIGNED`).
-- Users can **only** view their own pickups.
-- **(Glitch Fixed)** Added stricter collector access checks on viewing specific pickups via `GET /api/v1/pickups/:id` so they can only view pickups with a status of `Requested` or pickups explicitly assigned to them.
-- **(Vulnerability Fixed)** Added Zod validation to ensure that all `req.params.id` are valid MongoDB ObjectIds format. This prevents unhandled 500 Internal Server Error crashes (`CastError`) that can occur if an invalid format is passed.
-
-### 3. Collection Center Management
-
-Admin-only CRUD for managing e-waste collection centers:
-
-- **Routes** → [`collection-center.routes.ts`](src/pickup/collection-center.routes.ts)
-- **Controller** → [`collection-center.controller.ts`](src/pickup/collection-center.controller.ts)
-- **Service** → [`collection-center.service.ts`](src/pickup/collection-center.service.ts)
-- **Validation** → [`collection-center.validation.ts`](src/pickup/collection-center.validation.ts)
-
-| Method | Endpoint | Role | Description |
-|--------|----------|------|-------------|
-| `GET` | `/api/v1/collection-centers` | Any authenticated | List all collection centers |
-| `POST` | `/api/v1/collection-centers` | Admin only | Create a new collection center |
-
-### 4. Request Validation (Zod)
-
-All incoming requests are validated using **Zod** schemas before reaching the controller:
-
-- [`pickup.validation.ts`](src/pickup/pickup.validation.ts) — Validates pickup creation body, query filters, status update body, and route `id` params.
-- [`collection-center.validation.ts`](src/pickup/collection-center.validation.ts) — Validates collection center creation body.
-
-The `validate()` middleware wraps any Zod schema and returns structured `400 VALIDATION_ERROR` responses with field-level error messages.
+#### Scalability Principles
+- **State Machine Integrity**: Decoupling the transition logic into a pure static class makes testing the boundaries straightforward and guarantees safety.
+- **Delegated Triggers**: The module uses `rewards-client.ts` to trigger external reward systems and `dispatchEvent` for the gamification engine, offloading heavy processing.
+- **Zod First**: Validating schemas directly inside the route definitions guarantees controllers never handle malformed bodies or query parameters.
 
 ### 5. Authentication & Users
 
